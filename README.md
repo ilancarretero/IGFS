@@ -10,7 +10,7 @@ It is structured in the following folders:
 
 - Multiple examples under different early stopping regimes to obtain the local attributions corresponding to the implemented deep learning model (autoencoder + classifier head) under a 5-fold CV framework.
 
-- Implementation in the ````igfs_types``` folder of the attribute combination methods to extend Integrated Gradients to its global counterpart.
+- Implementation in the ```igfs_types``` folder of the attribute combination methods to extend Integrated Gradients to its global counterpart.
 
 - In this folder would also be the implementations of the other deep learning based feature selection models. To use these implementations go to the authors' public repositories or request them via email.
 
