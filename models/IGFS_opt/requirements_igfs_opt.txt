@@ -1,0 +1,7 @@
+captum==0.6.0
+numpy==1.22.2
+optuna==3.4.0
+pandas==1.5.2
+scikit_learn==0.24.2
+torch==1.14.0a0+44dac51
+openpyxl==3.1.2

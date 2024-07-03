@@ -1,0 +1,478 @@
+# Integrated Gradients Feature Selection auxiliary classes and functions
+
+# Import modules 
+import time
+import random
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn, optim
+from sklearn.metrics import confusion_matrix, roc_auc_score
+from captum.attr import IntegratedGradients
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+# Reproducibility
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+# Scaler
+def data_scaler(X_train):
+    # Normalize train  and test with MinMaxScaler
+    scaler = MinMaxScaler()
+    scaler.fit(X_train)
+    X_train_scaled = scaler.transform(X_train)
+    X_train_scaled = pd.DataFrame(X_train_scaled, columns=X_train.columns.tolist())
+    # Return partitions and normalized data
+    return X_train_scaled
+    
+# General settings for pytorch
+def transfer_device(X_train, y_train, X_val, y_val, criterion_rec, criterion_clf, model):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
+    X_val = X_val.to(device)
+    y_val = y_val.to(device)
+    criterion_rec = criterion_rec.to(device)
+    criterion_clf = criterion_clf.to(device)
+    model = model.to(device)
+    return X_train, y_train, X_val, y_val, criterion_rec, criterion_clf, model
+
+def torch_tensors(X_t_cv, y_t_cv, X_v_cv, y_v_cv):
+    X_t_cv = torch.FloatTensor(X_t_cv.values)
+    y_t_cv = torch.FloatTensor(y_t_cv.values)
+    X_v_cv = torch.FloatTensor(X_v_cv.values)
+    y_v_cv = torch.FloatTensor(y_v_cv.values)
+    return X_t_cv, y_t_cv, X_v_cv, y_v_cv
+
+def get_params(args):
+    # Get parameters and hyperparameters for each of the databases models
+    # Extracted from Optuna results
+    if args.db == 'colon':
+        params = {
+            'learning_rate': 0.00005,
+            'optimizer': 'adamW',
+            'ae_arch': 'big',
+            'latent_space': 32,
+            'lambda_1': 0.1,
+            'lambda_2': 0.001,
+            'activation_function': 'relu',
+            'batch_normalization': 'true',
+            'classifier_arch': 'no_hidden',
+            'batch_size': 8,
+            'weight_recon': 39,
+            'weight_cl': 48,
+            'cl_weights': 'false'}
+    elif args.db == 'leukemia':
+        params = {
+            'learning_rate': 0.001,
+            'optimizer': 'adamW',
+            'ae_arch': 'small',
+            'latent_space': 16,
+            'lambda_1': 0.01,
+            'lambda_2': 0,
+            'activation_function': 'relu',
+            'batch_normalization': 'true',
+            'classifier_arch': 'no_hidden',
+            'batch_size': 8,
+            'weight_recon': 30,
+            'weight_cl': 59,
+            'cl_weights': 'true'}
+    elif args.db == 'crohn':
+        params = {
+            'learning_rate': 0.00001,
+            'optimizer': 'adam',
+            'ae_arch': 'big',
+            'latent_space': 16,
+            'lambda_1': 0.1,
+            'lambda_2': 0.0001,
+            'activation_function': 'relu',
+            'batch_normalization': 'true',
+            'classifier_arch': 'no_hidden',
+            'batch_size': 8,
+            'weight_recon': 69,
+            'weight_cl': 37,
+            'cl_weights': 'false'
+        }
+    return params
+
+# NN Architecture and parameters/hiperparameters
+def param_hparam_nn(params, args, X, y):
+    # Loss functions
+    criterion_rec = nn.MSELoss()
+    if params['cl_weights'] == 'true':
+        pos_weight_number = np.sum(y[y.columns[0]] == 0) / np.sum(y[y.columns[0]] == 1)
+        criterion_clf = nn.BCEWithLogitsLoss(pos_weight=torch.FloatTensor([pos_weight_number]))
+    else:
+        criterion_clf = nn.BCEWithLogitsLoss()
+    # Layers and neurons inside each layer
+    if args.db == 'colon':
+        if params['ae_arch'] == 'small':
+            layers = [X.shape[1]] + [2**7] 
+        else:
+            layers = [X.shape[1]] + [2**9, 2**7] 
+    elif args.db == 'leukemia':
+        if params['ae_arch'] == 'small':
+            layers = [X.shape[1]] + [2**9, 2**6] 
+        else:
+            layers = [X.shape[1]] + [2**11, 2**9, 2**7] 
+    elif args.db == 'crohn':
+        if params['ae_arch'] == 'small':
+            layers = [X.shape[1]] + [2**10, 2**6]  
+        else:
+            layers = [X.shape[1]] + [2**12, 2**10, 2**8, 2**6] 
+    # Layers + latent space
+    layers = layers + [params['latent_space']]
+    # Activation function
+    if params['activation_function'] == 'relu':
+        act_funct = nn.ReLU()
+    elif params['activation_function'] == 'silu':
+        act_funct = nn.SiLU()
+    elif params['activation_function'] == 'prelu':
+        act_funct = nn.PReLU()
+    # Return
+    return criterion_rec, criterion_clf, layers, act_funct
+   
+class autoencoder_E2E(torch.nn.Module):
+    def __init__(self, layers, afunc, params):
+        super(autoencoder_E2E, self).__init__()
+        
+        # Define variables
+        batch_norm = True if params['batch_normalization'] == 'true' else False
+        hidden = True if params['classifier_arch'] == 'hidden' else False
+        
+        self.encoder_loop = nn.Sequential()
+        self.decoder_loop = nn.Sequential()
+        self.classifier = nn.Sequential()
+        
+        # Encoder layers
+        for i in range(len(layers)-1):
+            in_features = layers[i]
+            out_features = layers[i+1]
+            layer = nn.Linear(in_features, out_features)
+            self.encoder_loop.add_module(f"encoder_layer_{i}", layer)
+            if batch_norm:
+                self.encoder_loop.add_module(f"batch_norm_layer_{i}", nn.BatchNorm1d(out_features))
+            self.encoder_loop.add_module(f"encoder_activation_{i}", afunc)
+            # if i  == (len(layers) - 2): # PENSAR LA CONDICIÓN QUE DEBERÍA PONER
+                #self.encoder_loop.add_module(f"encoder_normalization_{i}", nn.BatchNorm1d(neurons[-1]))
+            #    pass
+              
+        # Decoder layers
+        for i in range(len(layers)-1, 0, -1):
+            in_features = layers[i]
+            out_features = layers[i-1]
+            layer = nn.Linear(in_features, out_features)
+            self.decoder_loop.add_module(f"decoder_layer_{i}", layer)
+            if batch_norm:
+                self.decoder_loop.add_module(f"batch_norm_layer_{i}", nn.BatchNorm1d(out_features))
+            if i != 1: # 1 porque en el range vamos al revés, por lo que es en esa capa donde nos interesa hacer la sigmoide
+                self.decoder_loop.add_module(f"decoder_activation_{i}", afunc)
+            else: # PENSAR LA CONDICIÓN QUE DEBERÍA PONER
+                self.decoder_loop.add_module(f"decoder_sigmoid_{i}", nn.Sigmoid()) 
+                pass 
+                
+        # Classifier layers
+        if hidden:
+            layer = nn.Linear(layers[-1], int(layers[-1]/2))
+            self.classifier.add_module(f'hidden_layer', layer)
+            self.classifier.add_module(f'hidden_activation', afunc)
+            layer = nn.Linear(int(layers[-1]/2), 1)
+            self.classifier.add_module(f'classification_layer', layer)
+            #self.classifier.add_module(f'cl_layer_activation', nn.Sigmoid())
+        else:
+            layer = nn.Linear(layers[-1], 1)
+            self.classifier.add_module(f'classification_layer', layer)
+            #self.classifier.add_module(f'cl_layer_activation', nn.Sigmoid())
+     
+    def forward(self, x):
+        encoded_loop = self.encoder_loop(x)
+        decoded_loop = self.decoder_loop(encoded_loop)
+        out_loop = self.classifier(encoded_loop)
+        return decoded_loop, out_loop, encoded_loop 
+
+class SubModel(nn.Module):
+    def __init__(self, model):
+        super(SubModel, self).__init__()
+        self.og_net = model
+        
+    def forward(self, x):
+        _, out_probs, _ = self.og_net(x)
+        return out_probs
+
+# Train and evaluation functions
+class FastTensorDataLoader:
+    """
+    A DataLoader-like object for a set of tensors that can be much faster than
+    TensorDataset + DataLoader because dataloader grabs individual indices of
+    the dataset and calls cat (slow).
+    Source: https://discuss.pytorch.org/t/dataloader-much-slower-than-manual-batching/27014/6
+    """
+    def __init__(self, *tensors, batch_size=0, shuffle=False):
+        """
+        Initialize a FastTensorDataLoader.
+
+        :param *tensors: tensors to store. Must have the same length @ dim 0.
+        :param batch_size: batch size to load.
+        :param shuffle: if True, shuffle the data *in-place* whenever an
+            iterator is created out of this object.
+
+        :returns: A FastTensorDataLoader.
+        """
+        # Assert and self definitions
+        assert all(t.shape[0] == tensors[0].shape[0] for t in tensors)
+        self.tensors = tensors
+        # Full batch size
+        if batch_size == 0:
+            batch_size = self.tensors[0].shape[0]
+        self.dataset_len = self.tensors[0].shape[0]
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        # Calculate # batches
+        n_batches, remainder = divmod(self.dataset_len, self.batch_size)
+        if remainder > 0:
+            n_batches += 1
+        self.n_batches = n_batches
+    def __iter__(self):
+        if self.shuffle:
+            r = torch.randperm(self.dataset_len)
+            self.tensors = [t[r] for t in self.tensors]
+        self.i = 0
+        return self
+
+    def __next__(self):
+        if self.i >= (self.dataset_len-1):
+            raise StopIteration
+        batch = tuple(t[self.i:self.i+self.batch_size] for t in self.tensors)
+        self.i += self.batch_size
+        return batch
+
+    def __len__(self):
+        return self.n_batches
+
+def calculate_accuracy(out, labels):
+            round_pred = torch.round(out)
+            similarity = round_pred == labels
+            correct = similarity.sum()
+            accuracy = correct/labels.shape[0] * 100
+            return accuracy, round_pred
+        
+def train(train_tensor, y_train_tensor, model, optimizer, criterion1, criterion2, params, weight_rec=70, weight_bce=1):
+            inputs = train_tensor
+            labels = torch.reshape(y_train_tensor, (y_train_tensor.shape[0], 1))
+            optimizer.zero_grad()
+            decoded, out, _ = model(inputs)
+            loss1 = criterion1(decoded, inputs)
+            loss2 = criterion2(out, labels)
+            weight1 = weight_rec#70#30 #30 #70 peso optimo para metilacion #1
+            weight2 = weight_bce#1 #0.002
+            # L1 and L2 regularization term
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            l1_reg = torch.tensor(0.).to(device=device)
+            l2_reg = torch.tensor(0.).to(device=device)
+            for param in model.parameters():
+                    l1_reg += torch.norm(param, p=1)
+                    l2_reg += torch.norm(param, p=2)
+            initial_loss = weight1 * loss1 + weight2 * loss2 
+            loss = initial_loss + float(params['lambda_1']) * l1_reg + float(params['lambda_2'])* l2_reg
+            acc, _ = calculate_accuracy(torch.sigmoid(out), labels)
+            loss.backward()
+            optimizer.step()
+            return loss.item(), acc.item(), labels, out
+        
+def evaluate(val_tensor, y_val_tensor, model, criterion1, criterion2):
+    with torch.no_grad():
+        inputs = val_tensor
+        labels = torch.reshape(y_val_tensor, (y_val_tensor.shape[0], 1))
+        decoded, out, _ = model(inputs)
+        loss1 = criterion1(decoded, inputs)
+        loss2 = criterion2(out, labels)
+        weigth1 = 1
+        weigth2 = 1
+        loss = weigth1 * loss1 + weigth2 * loss2
+        acc, _ = calculate_accuracy(torch.sigmoid(out), labels)
+    return loss.item(), acc.item(), labels, out
+             
+# Train and evaluation loop
+def train_eval_loop(epochs, train_tensor, y_train_tensor, val_tensor, y_val_tensor, model, optimizer, scheduler, criterion_rec, criterion_clf, params, i, classes, path_model):
+    best_v_AUC = 0
+    epochs_no_improve = 0
+    max_epochs_stop = 500
+    for epoch in range(epochs):
+        # Define class Dataloader class
+        train_batches = FastTensorDataLoader(train_tensor, y_train_tensor,
+                                         batch_size=params['batch_size'],
+                                         shuffle=True)
+        # Train
+        model.train(True)
+        running_loss = 0.0
+        running_acc = 0.0
+        counter = 1
+        for x_train_batch, y_train_batch in train_batches:
+            train_loss, train_acc, labels, out = train(x_train_batch, y_train_batch, model, optimizer, criterion_rec, criterion_clf, params, weight_rec=params['weight_recon'], weight_bce=params['weight_cl'])
+            running_loss += train_loss
+            running_acc += train_acc
+            counter += 1
+        loss_per_epoch = running_loss / counter
+        acc_per_epoch = running_acc / counter
+        # Evaluation
+        model.eval()
+        valid_loss, valid_acc, labels, out = evaluate(val_tensor, y_val_tensor, model, criterion_rec, criterion_clf)
+        y_pred_v, y_true_v, results_v = clf_results(labels, torch.sigmoid(out), classes)
+        AUC = 6
+        val_AUC = results_v[6]
+        # Scheduler
+        scheduler.step(valid_loss)
+        # Save best validation loss
+        if val_AUC >= best_v_AUC:
+            # Metrics and variables
+            best_v_AUC = val_AUC
+            epochs_no_improve = 0
+            best_epoch = epoch
+            best_labels = labels
+            best_out = out
+            # Save model
+            torch.save(model.state_dict(), path_model)
+        else:
+            epochs_no_improve += 1
+        # Early stopping
+        if epochs_no_improve == max_epochs_stop:
+            print(f'Early stopping after {max_epochs_stop} with no improvement in epoch {epoch+1}')
+            break
+        # Prints results per epoch
+        if epoch % 100 == 0:
+            print(f'-------------- Epoch: {epoch+1:02} ----------------')
+            print(f'\tTrain Loss: {loss_per_epoch:.3f} | Train Acc: {acc_per_epoch:.2f}%')
+            print(f'\t Val. Loss: {valid_loss:.3f} |  Val. Acc: {valid_acc:.2f}%')  
+    print(f'---------------------------- CV: {i} -------------------------------------')    
+    return best_labels, best_out, best_epoch
+
+# Obtain metrics
+def report_classification_results(y_true, y_pred, classes):
+    """ Print confusion matrix and show metrics """
+    # Extract confusion matrix
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    conf_mat = confusion_matrix(y_true, y_pred)
+    #print(conf_mat)
+
+    # Compute metrics
+    headers = []
+    g_TP, g_TN, g_FN, g_FP = [],[],[],[]
+    ss, ee, pp, nn, ff, aa = [],[],[],[],[],[]
+    S, E, PPV, NPV, F, ACC = ['Sensitivity'], ['Specificity'], ['PPV (precision)'], ['NPV'], ['F1-score'], ['Accuracy'] #Positive Predictive Value/Negative Predictive Value
+    i = 1
+    headers.append(classes[i])
+
+    # Extract indicators per class
+    TP = conf_mat[i,i]
+    #TN = sum(sum(conf_mat))-sum(conf_mat[i,:])-sum(conf_mat[:,i])
+    FN = sum(conf_mat[i,:])-conf_mat[i,i]
+    FP = sum(conf_mat[:,i])-conf_mat[i,i]
+    TN = sum(sum(conf_mat))-TP-FP-FN
+
+    # Extract metrics per class
+    sen = TP/(TP+FN)
+    spe = TN/(TN+FP)
+    ppv = TP/(TP+FP)
+    npv = TN/(TN+FN)
+    f1_s = 2*(ppv*sen/(ppv+sen))
+    acc = (TP+TN)/(TP+TN+FP+FN)
+
+    # Create table for printing
+    S.append(str(round(sen,4)))
+    E.append(str(round(spe,4)))
+    PPV.append(str(round(ppv,4)))
+    NPV.append(str(round(npv,4)))
+    F.append(str(round(f1_s,4)))
+    ACC.append(str(round(acc,4)))
+    auc = roc_auc_score(y_true=y_true, y_score=y_pred)
+    metrics_array = np.array([acc, sen, spe, ppv, npv, f1_s, auc])
+    return metrics_array
+
+def clf_results(labels, out, classes):
+    labels_cpu = torch.Tensor.cpu(labels)
+    predictions = torch.round(out)
+    predictions_cpu = torch.Tensor.cpu(predictions)
+    y_pred = predictions_cpu.numpy().astype(int)
+    y_true = labels_cpu.numpy().astype(int)
+    results = report_classification_results(y_true, y_pred, classes)
+    return y_pred, y_true, results
+    
+# Integrated gradients relevance feature method
+def IG_attributions(submodel, val_cv, y_val, round_pred, val_samples=7): # OJO: NECESARIO DEFINIR CORRECT_IDX_PREDS EN IGFS_METH
+    """Obtain input attributions and correct indices"""
+    
+    # Device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Obtener muestras predichas correctamente
+    res_var = y_val[y_val.columns[0]].values
+    pred = round_pred.squeeze().astype(int)
+    correct_samples = res_var == pred
+    y_val_correct = y_val.loc[correct_samples]
+    correct_indices = y_val_correct.index.values
+    if val_samples != correct_indices.shape[0]: # correct_idx_preds.shape[1]
+        diff = val_samples - correct_indices.shape[0]
+        nans_array = np.full(diff, np.nan)
+        correct_indices = np.append(correct_indices, nans_array)
+    correct_indices = np.expand_dims(correct_indices, axis=0)
+    
+    # Apply integrated gradients
+    val_tensor = torch.FloatTensor(val_cv.values).to(device)
+    ig = IntegratedGradients(submodel)
+    attr, delta = ig.attribute(val_tensor, n_steps=900, return_convergence_delta=True) #optimal number of steps
+    attr = attr.to('cpu').detach().numpy()
+    delta = delta.to('cpu').numpy()
+    
+    # Convert to dataframe and include the name of the regions 
+    attr_df = pd.DataFrame(attr)
+    attr_df.columns = val_cv.columns
+    attr_df = attr_df.T
+    
+    # Compute mean
+    attr_df_mean = attr_df.mean(axis=1)
+    attr_df_mean.columns = y_val.index.to_list() # revisar porque probablemente quiera cambiar los nombres de las columnas de attr_df y no de attr_df_mean
+    attr_df.insert(0, 'attr_mean', attr_df_mean)
+    attr_df.insert(0, 'variable', val_cv.columns)
+    
+    # Sort dataframe with absolute values of the mean attributions for the subjects
+    sorted_attr_df = attr_df.loc[attr_df['attr_mean'].sort_values(ascending=False).index]
+    
+    # Return dataframe and boolean array with correct val samples predictions
+    return sorted_attr_df, correct_indices
+
+# DATA WRANGLING OF IG RESULTS AND SELECTION OF CORRECT VARIABLES
+def selected_correct_vars_attr(y, sorted_attr_df, correct_indices, class_1=True, cv=0, full=True):
+    '''Select samples correctly classify and mantain the attributions'''
+    # Filter indices of melanoma and nevus samples
+    if class_1:
+        indices = y.loc[y[y.columns[0]] == 1].index.to_list()
+        indices_str = [str(element) for element in indices]
+    else:
+        indices = y.loc[y[y.columns[0]] == 0].index.to_list()
+        indices_str = [str(element) for element in indices]
+
+    # Filter attr and select cols
+    if full:
+        select_cols = list(set(indices_str).intersection(sorted_attr_df.columns.to_list()))
+        select_cols.append('variable')
+        samples_attr = sorted_attr_df.loc[:, select_cols]
+    else:
+        select_cols = list(set(indices_str).intersection(sorted_attr_df.columns.to_list()))
+        select_cols = list(set(select_cols).intersection(list(map(str, correct_indices.squeeze().astype(int).tolist())))) 
+        select_cols.append('variable')
+        samples_attr = sorted_attr_df.loc[:, select_cols]
+    
+    # Change samples names
+    samples_names = ['obs_' + str(samples_attr.columns[i]) + '_cv_' + str(cv) for i in range(len(samples_attr.columns.to_list()) - 1)]
+    samples_names.append('variable')
+    samples_attr.columns = samples_names
+    
+    # Return attributions values for the fold correct samples
+    return samples_attr
